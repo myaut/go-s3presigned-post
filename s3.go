@@ -1,4 +1,4 @@
-package s3
+package s3presign
 
 import (
 	"crypto/hmac"
@@ -9,43 +9,50 @@ import (
 	"time"
 )
 
+const (
+	signatureService = "s3"
+	signatureFormat  = "aws4_request"
+)
+
 // Represents AWS credentials and config.
 type Credentials struct {
-	Region string
-	Bucket string
-	AccessKeyID string
+	Region          string
+	Bucket          string
+	AccessKeyID     string
 	SecretAccessKey string
 }
 
 // Represents policy options.
 type PolicyOptions struct {
-	ExpiryMinutes int
-	MaxFileSize int
+	ExpiryMinutes   int
+	MaxFileSize     int
+	ACL             string
+	RedirectBaseURL string
 }
 
 // Represents presigned POST information.
 type PresignedPOST struct {
-	Key string         `json:"key"`
-	Policy string      `json:"policy"`
-	Signature string   `json:"signature"`
-	Action string      `json:"action"`
-	Credential string  `json:"credential"`
-	Date string        `json:"date"`
+	Key        string `json:"key"`
+	Policy     string `json:"policy"`
+	Signature  string `json:"signature"`
+	Action     string `json:"action"`
+	Credential string `json:"credential"`
+	Date       string `json:"date"`
 }
 
 // Creates a new presigned POST.
 func NewPresignedPOST(key string, c *Credentials, o *PolicyOptions) (*PresignedPOST, error) {
 	p := NewPolicy(key, c, o)
 	b64Policy := p.Base64()
-	signature := createSignature(p.C, p.Date[:8], b64Policy)
-	action := fmt.Sprintf("https://%s.s3.amazonaws.com/", p.Bucket)
+	signature := createSignature(p.C, p.ShortDate, b64Policy)
+	action := fmt.Sprintf("https://storage.yandexcloud.net/%s", p.Bucket)
 	post := &PresignedPOST{
-		Key: p.Key,
-		Policy: b64Policy,
-		Signature: signature,
-		Action: action,
+		Key:        p.Key,
+		Policy:     b64Policy,
+		Signature:  signature,
+		Action:     action,
 		Credential: p.Credential,
-		Date: p.Date,
+		Date:       p.Date,
 	}
 	return post, nil
 }
@@ -54,8 +61,8 @@ func NewPresignedPOST(key string, c *Credentials, o *PolicyOptions) (*PresignedP
 func createSignature(c *Credentials, formattedShortTime, stringToSign string) string {
 	h1 := makeHmac([]byte("AWS4"+c.SecretAccessKey), []byte(formattedShortTime))
 	h2 := makeHmac(h1, []byte(c.Region))
-	h3 := makeHmac(h2, []byte("s3"))
-	h4 := makeHmac(h3, []byte("aws4_request"))
+	h3 := makeHmac(h2, []byte(signatureService))
+	h4 := makeHmac(h3, []byte(signatureFormat))
 	signature := makeHmac(h4, []byte(stringToSign))
 	return hex.EncodeToString(signature)
 }
@@ -73,49 +80,54 @@ const policyDocument = `
   "conditions": [
     {"bucket": "%s"},
     ["starts-with", "$key", "%s"],
-    {"acl": "public-read"},
+    {"acl": "%s"},
     ["content-length-range", 1, %d],
+    ["starts-with", "$success_action_redirect", "%s"],
 
     {"x-amz-credential": "%s"},
     {"x-amz-algorithm": "AWS4-HMAC-SHA256"},
-    {"x-amz-date": "%s" }
+    {"x-amz-date": "%s"}
   ]
 }
 `
 
 const (
 	expirationFormat = "2006-01-02T15:04:05.000Z"
-	timeFormat = "20060102T150405Z"
-	shortTimeFormat = "20060102"
+	timeFormat       = "20060102T150405Z"
+	shortDateFormat  = "20060102"
 )
 
 // Represents a new policy for uploading sounds.
 type policy struct {
 	Expiration string
-	Region string
-	Bucket string
-	Key string
+	Region     string
+	Bucket     string
+	Key        string
 	Credential string
-	Date string
-	C *Credentials
-	O *PolicyOptions
+	Date       string
+	ShortDate  string
+	C          *Credentials
+	O          *PolicyOptions
 }
 
 // Creates a new policy.
 func NewPolicy(key string, c *Credentials, o *PolicyOptions) *policy {
 	t := time.Now().Add(time.Minute * time.Duration(o.ExpiryMinutes))
-	formattedShortTime := t.UTC().Format(shortTimeFormat)
+	shortDate := t.UTC().Format(shortDateFormat)
 	date := t.UTC().Format(timeFormat)
-	cred := fmt.Sprintf("%s/%s/%s/s3/aws4_request", c.AccessKeyID, formattedShortTime, c.Region)
+	cred := fmt.Sprintf("%s/%s/%s/%s/%s", c.AccessKeyID, shortDate, c.Region,
+		signatureService, signatureFormat)
+
 	return &policy{
 		Expiration: t.UTC().Format(expirationFormat),
-		Region: c.Region,
-		Bucket: c.Bucket,
-		Key: key,
+		Region:     c.Region,
+		Bucket:     c.Bucket,
+		Key:        key,
 		Credential: cred,
-		Date: date,
-		C: c,
-		O: o,
+		Date:       date,
+		ShortDate:  shortDate,
+		C:          c,
+		O:          o,
 	}
 }
 
@@ -125,7 +137,9 @@ func (p *policy) String() string {
 		p.Expiration,
 		p.Bucket,
 		p.Key,
+		p.O.ACL,
 		p.O.MaxFileSize,
+		p.O.RedirectBaseURL,
 		p.Credential,
 		p.Date,
 	)
